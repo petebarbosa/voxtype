@@ -478,17 +478,20 @@ This shows all available models across all engines, marks installed models, and 
 
 ### On-Demand Loading
 
-All engines support `on_demand_loading = true`, which loads the model only when you start recording and unloads it after transcription. This saves memory and battery on laptops at the cost of a short delay before the first transcription.
+Every engine has its own `on_demand_loading = true`, which loads the model only when you start recording and unloads it after transcription. This saves memory and battery on laptops at the cost of a short delay before the first transcription. The setting lives in each engine's section (for example `[whisper]` or `[parakeet]`), so it is configured per engine.
+
+To skip the reload for dictations that arrive close together, set the root `idle_unload_secs` key. It keeps the active engine's primary model loaded for N idle seconds after each dictation, for any engine with on-demand loading on (`0` unloads right away). See the [Configuration Guide](CONFIGURATION.md#idle_unload_secs).
 
 ### Common Config Options
 
-Every ONNX engine supports these options:
+Every ONNX engine supports these options; `idle_unload_secs` is a root key shared by all engines:
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `model` | varies | Model name or path to model directory |
 | `threads` | auto | Number of CPU threads for ONNX Runtime |
-| `on_demand_loading` | false | Load model on demand to save memory |
+| `on_demand_loading` | false | Load this engine's model on demand to save memory |
+| `idle_unload_secs` (root) | `0` | Keep the active engine's model loaded for N idle seconds; requires that engine's `on_demand_loading` |
 
 Whisper has additional options (`language`, `gpu_isolation`, `mode`, etc.) documented in the [Configuration Guide](CONFIGURATION.md).
 

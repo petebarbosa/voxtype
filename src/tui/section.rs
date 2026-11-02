@@ -64,7 +64,7 @@ impl Section {
             Section::Notifications => "Desktop notifications and expire times",
             Section::Osd => "Floating waveform OSD: frontend, position, size, opacity",
             Section::Waybar => "Status integration: icon theme, overrides",
-            Section::Advanced => "GPU isolation, flash attention, on-demand loading",
+            Section::Advanced => "GPU isolation, on-demand loading, idle unload, flash attention",
         }
     }
 }

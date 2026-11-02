@@ -126,6 +126,18 @@ pub struct Cli {
     #[arg(long, help_heading = "Transcription", hide_short_help = true)]
     pub eager_processing: bool,
 
+    /// Seconds the primary model of the active engine stays loaded after a dictation
+    #[arg(
+        long,
+        value_name = "SECS",
+        help_heading = "Transcription",
+        hide_short_help = true,
+        long_help = "Seconds the primary model of the active engine stays loaded after a\n\
+        dictation when that engine's on-demand loading is on. 0 unloads after each\n\
+        dictation."
+    )]
+    pub idle_unload_secs: Option<u64>,
+
     // -- Whisper-specific --
     /// Disable context window optimization for short recordings
     #[arg(long, help_heading = "Whisper", hide_short_help = true)]
@@ -672,5 +684,33 @@ mod tests {
             }
             _ => panic!("Expected Transcribe command"),
         }
+    }
+
+    // =========================================================================
+    // Idle unload flag tests
+    // =========================================================================
+
+    #[test]
+    fn test_idle_unload_secs_flag() {
+        let cli = Cli::parse_from(["voxtype", "--idle-unload-secs", "300"]);
+        assert_eq!(cli.idle_unload_secs, Some(300));
+    }
+
+    #[test]
+    fn test_idle_unload_secs_flag_zero() {
+        // 0 is a real override (unload immediately), not "unset".
+        let cli = Cli::parse_from(["voxtype", "--idle-unload-secs", "0"]);
+        assert_eq!(cli.idle_unload_secs, Some(0));
+    }
+
+    #[test]
+    fn test_idle_unload_secs_flag_not_set() {
+        let cli = Cli::parse_from(["voxtype"]);
+        assert!(cli.idle_unload_secs.is_none());
+    }
+
+    #[test]
+    fn test_idle_unload_secs_rejects_non_numeric() {
+        assert!(Cli::try_parse_from(["voxtype", "--idle-unload-secs", "5m"]).is_err());
     }
 }

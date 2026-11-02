@@ -120,6 +120,11 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
         }
     }
 
+    if let Some(secs) = cli.idle_unload_secs {
+        // Engine-agnostic: applies to whichever engine the config selects.
+        config.idle_unload_secs = secs;
+    }
+
     // Hotkey overrides
     if let Some(ref hotkey) = cli.hotkey {
         config.hotkey.key = hotkey.clone();
@@ -359,4 +364,53 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     }
 
     top_level_model
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli_from(args: &[&str]) -> Cli {
+        let mut argv = vec!["voxtype"];
+        argv.extend_from_slice(args);
+        Cli::parse_from(argv)
+    }
+
+    #[test]
+    fn idle_unload_secs_flag_overrides_config() {
+        let mut config = config::Config {
+            idle_unload_secs: 60,
+            ..config::Config::default()
+        };
+
+        apply_cli_overrides(&mut config, &cli_from(&["--idle-unload-secs", "300"]));
+
+        assert_eq!(config.idle_unload_secs, 300);
+    }
+
+    #[test]
+    fn idle_unload_secs_absent_keeps_config_value() {
+        // Unset means "fall through" to the config file / env layers.
+        let mut config = config::Config {
+            idle_unload_secs: 60,
+            ..config::Config::default()
+        };
+
+        apply_cli_overrides(&mut config, &cli_from(&[]));
+
+        assert_eq!(config.idle_unload_secs, 60);
+    }
+
+    #[test]
+    fn idle_unload_secs_zero_overrides_config() {
+        let mut config = config::Config {
+            idle_unload_secs: 300,
+            ..config::Config::default()
+        };
+
+        apply_cli_overrides(&mut config, &cli_from(&["--idle-unload-secs", "0"]));
+
+        assert_eq!(config.idle_unload_secs, 0);
+    }
 }

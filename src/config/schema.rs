@@ -308,6 +308,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Transcription engine",
         "Which ASR engine transcribes your audio. Non-whisper engines must be compiled into the binary.",
     ),
+    spec(
+        "idle_unload_secs",
+        "",
+        "idle_unload_secs",
+        KeyType::Int { min: 0, max: 86400 },
+        "Advanced",
+        "Idle unload (seconds)",
+        "Seconds the primary model of the active engine stays loaded after a dictation when on-demand loading is on. 0 unloads after each dictation.",
+    ),
     // whisper
     spec(
         "whisper.model",
@@ -2428,6 +2437,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
 
     let v = match key {
         "engine" => json!(cfg.engine.name()),
+        "idle_unload_secs" => json!(cfg.idle_unload_secs),
 
         "whisper.model" => json!(cfg.whisper.model),
         "whisper.secondary_model" => opt_str(cfg.whisper.secondary_model.as_ref()),
@@ -3051,6 +3061,22 @@ mod tests {
             .unwrap(),
             json!(false),
             "unset should fall back to the serde default"
+        );
+    }
+
+    #[test]
+    fn root_idle_unload_secs_schema_bounds_and_default() {
+        let spec = CONFIG_KEYS
+            .iter()
+            .find(|s| s.key == "idle_unload_secs")
+            .expect("idle_unload_secs must be user-settable");
+        assert_eq!(spec.ty, KeyType::Int { min: 0, max: 86400 });
+        assert_eq!(spec.section, "Advanced");
+        assert_eq!(spec.engine, None);
+        // Default behavior: unload the primary model after each dictation.
+        assert_eq!(
+            resolve("idle_unload_secs", &Config::default()),
+            Some(json!(0))
         );
     }
 

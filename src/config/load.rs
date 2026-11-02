@@ -136,6 +136,11 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     if let Ok(val) = std::env::var("VOXTYPE_ON_DEMAND_LOADING") {
         config.whisper.on_demand_loading = parse_bool_env(&val);
     }
+    if let Ok(val) = std::env::var("VOXTYPE_IDLE_UNLOAD_SECS") {
+        if let Ok(n) = val.parse::<u64>() {
+            config.idle_unload_secs = n;
+        }
+    }
     if let Ok(dir) = std::env::var("VOXTYPE_OPENVINO_DIR") {
         config
             .openvino
@@ -313,6 +318,21 @@ mod tests {
             super::super::schema::misplaced_section_home("whisper"),
             None
         );
+    }
+
+    #[test]
+    fn idle_unload_secs_env_overrides_config_file() {
+        // This test owns VOXTYPE_IDLE_UNLOAD_SECS; no other test reads it.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "idle_unload_secs = 30\n").unwrap();
+
+        std::env::set_var("VOXTYPE_IDLE_UNLOAD_SECS", "300");
+        let loaded = load_config(Some(&config_path));
+        std::env::remove_var("VOXTYPE_IDLE_UNLOAD_SECS");
+        let config = loaded.unwrap();
+
+        assert_eq!(config.idle_unload_secs, 300);
     }
 
     #[test]

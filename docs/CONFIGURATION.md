@@ -96,6 +96,41 @@ new engine to take effect.
 
 ---
 
+## idle_unload_secs
+
+**Type:** Integer
+**Default:** `0`
+**Required:** No
+
+Idle model retention for the active engine. This is a root key, not a `[whisper]` setting: it applies to whichever engine `engine` selects.
+
+**Values:**
+- `0` (default) - Unload after every dictation. Each dictation pays the model load.
+- `N > 0` - Keep the primary model loaded for N idle seconds. The first dictation loads it; a dictation that starts inside the window reuses it and restarts the window when that dictation ends, including on cancellation or failure.
+
+The timer is checked about once a second, so the model may stay resident roughly a second past the configured window.
+
+**Requirements:**
+- The active engine must have `on_demand_loading = true`. Without it the model stays resident and this key has no effect.
+- Whisper additionally requires `gpu_isolation = false` and `max_loaded_models > 0`. `gpu_isolation = true` runs each recording in a subprocess that exits when transcription ends, so there is no resident model to keep.
+- Secondary Whisper models keep following `whisper.cold_model_timeout_secs`. `0` means different things in the two settings: `idle_unload_secs = 0` unloads immediately, while `cold_model_timeout_secs = 0` never unloads.
+- Applies to the local engines: Whisper, Parakeet, Moonshine, SenseVoice, Paraformer, Dolphin, Omnilingual, Cohere, and OpenVINO. Soniox is a cloud engine with no local model, and the remote/CLI Whisper backends do not retain a model either.
+- Eviction only runs while the daemon is idle. An active meeting defers it.
+- Streaming still requires a resident model (#779). Retention speeds up batch dictation; it does not make streaming work with on-demand loading.
+
+**Precedence:** `--idle-unload-secs` > `VOXTYPE_IDLE_UNLOAD_SECS` > config > default `0`.
+
+**Example:**
+```toml
+# root, applies to the active engine
+idle_unload_secs = 300
+
+[whisper]
+on_demand_loading = true
+```
+
+---
+
 ## [hotkey]
 
 Controls which key triggers push-to-talk recording.
@@ -704,7 +739,7 @@ threads = 4  # Limit to 4 threads
 **Default:** `false`
 **Required:** No
 
-Controls when the Whisper model is loaded into memory.
+Controls when the Whisper model is loaded into memory. Every engine has its own `on_demand_loading`; this section documents the `[whisper]` one.
 
 **Values:**
 - `false` (default) - Model is loaded at daemon startup and kept in memory. Provides fastest response times but uses memory/VRAM continuously.
@@ -729,6 +764,8 @@ on_demand_loading = true  # Free VRAM when not transcribing
 ```
 
 **Performance note:** On modern systems with SSDs, model loading typically takes under 1 second for base/small models. Larger models (medium, large-v3) may take 2-3 seconds to load.
+
+To skip that reload for dictations that arrive close together, set the root [`idle_unload_secs`](#idle_unload_secs). It applies to the active engine, not just Whisper.
 
 ### gpu_isolation
 
@@ -3579,6 +3616,7 @@ Any config file setting can be overridden via environment variable. These are ap
 | `VOXTYPE_GPU_ISOLATION` | bool | `whisper.gpu_isolation` |
 | `VOXTYPE_GPU_DEVICE` | integer | `whisper.gpu_device` |
 | `VOXTYPE_ON_DEMAND_LOADING` | bool | `whisper.on_demand_loading` |
+| `VOXTYPE_IDLE_UNLOAD_SECS` | integer | `idle_unload_secs` |
 | `VOXTYPE_REMOTE_ENDPOINT` | string | `whisper.remote_endpoint` |
 | `VOXTYPE_WHISPER_API_KEY` | string | `whisper.remote_api_key` |
 

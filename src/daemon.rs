@@ -277,12 +277,39 @@ fn acquire_instance_lock(runtime_dir: &std::path::Path) -> Result<Pidlock> {
 /// heap and is unaffected; only a separate transcription process frees that,
 /// which today is Whisper's `gpu_isolation`.
 fn release_freed_memory() {
+    #[cfg(test)]
+    TRIM_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: malloc_trim only releases free heap pages; it has no
     // preconditions and does not touch live allocations.
     unsafe {
         libc::malloc_trim(0);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Test-only count of trim requests. The syscall itself is not observable
+    // from Rust, but whether the daemon asked for a trim is.
+    static TRIM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn trim_calls_for_test() -> usize {
+    TRIM_CALLS.with(std::cell::Cell::get)
+}
+
+/// Build the persistent timer for idle-model eviction.
+///
+/// A `sleep()` arm inside `select!` is recreated on every loop iteration, so
+/// a faster arm (the 50ms meeting poll) restarts it before it can ever fire
+/// (#644). An interval keeps its absolute deadline across cancelled `tick()`
+/// futures, so eviction still runs while a meeting is recording.
+fn new_idle_eviction_poll(period: Duration) -> tokio::time::Interval {
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll
 }
 
 /// Remove PID file on shutdown
@@ -1096,7 +1123,18 @@ pub struct Daemon {
     // panic recovery in handle_transcription_result can discard a poisoned
     // instance (#643) — get_transcriber_for_recording re-creates it on the
     // next recording when it finds this empty.
+    //
+    // With `idle_unload_secs > 0` and on-demand loading on, this is also the
+    // single retained slot for the primary model of every non-Whisper engine:
+    // the loaded primary stays here between dictations and is evicted after
+    // the idle window (see `retains_preloaded_primary` and
+    // `evict_idle_models_if_idle`).
     transcriber_preloaded: Option<Arc<dyn Transcriber>>,
+    // When `transcriber_preloaded` was last used or adopted as the retained
+    // primary. `None` whenever the slot was populated outside the retention
+    // path (resident startup preload, panic recovery) so the idle window
+    // never applies to it.
+    preloaded_last_used: Option<Instant>,
     // Background tasks for eager chunk transcriptions (chunk_index, task)
     eager_chunk_tasks: Vec<(
         usize,
@@ -1228,6 +1266,7 @@ impl Daemon {
             transcription_task: None,
             active_transcriber: None,
             transcriber_preloaded: None,
+            preloaded_last_used: None,
             eager_chunk_tasks: Vec::new(),
             vad,
             meeting_daemon: None,
@@ -1551,6 +1590,12 @@ impl Daemon {
                 return false;
             }
         }
+        // Streaming needs a resident model, so it keeps requiring the
+        // non-on-demand path (#779). Retaining the primary must not silently
+        // change a recording into a streaming session.
+        if self.config.on_demand_loading() {
+            return false;
+        }
         // Clone out of the field so the borrow doesn't overlap the
         // `&mut self` capture start below.
         let Some(transcriber) = self.transcriber_preloaded.clone() else {
@@ -1746,6 +1791,8 @@ impl Daemon {
                 Err(()) => {
                     *state = State::Idle;
                     self.update_state("idle");
+                    self.touch_retained_models();
+                    *eager_transcriber = None;
                     return;
                 }
             };
@@ -1969,6 +2016,7 @@ impl Daemon {
             *state = State::Idle;
             *eager_transcriber = None;
             self.update_state("idle");
+            self.touch_retained_models();
             self.play_feedback(SoundEvent::Cancelled);
 
             // Run post_output_command to reset compositor submap
@@ -2002,6 +2050,7 @@ impl Daemon {
             discard_recording_overrides();
             *state = State::Idle;
             self.update_state("idle");
+            self.touch_retained_models();
             self.play_feedback(SoundEvent::Cancelled);
 
             // Run post_output_command to reset compositor submap
@@ -2019,6 +2068,58 @@ impl Daemon {
             )
             .await;
         }
+    }
+
+    /// Cancel a live recording via the hotkey and return to Idle.
+    ///
+    /// Mirrors the `record cancel` recording path, including discarding the
+    /// pending model load and eager chunk tasks.
+    async fn cancel_recording_to_idle(
+        &mut self,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        eager_transcriber: &mut Option<Arc<dyn Transcriber>>,
+    ) {
+        // A cancelled external-trigger session is still an ended session —
+        // tell the caller and disarm tracking.
+        self.end_external_session(state.is_recording()).await;
+
+        // Stop recording and discard audio
+        if let Some(mut capture) = audio_capture.take() {
+            let _ = capture.stop().await;
+        }
+        self.restore_recording_media();
+
+        self.discard_pending_model_load();
+
+        // Cancel any pending eager chunk tasks
+        for (_, task) in self.eager_chunk_tasks.drain(..) {
+            task.abort();
+        }
+
+        discard_recording_overrides();
+        *state = State::Idle;
+        self.update_state("idle");
+        self.touch_retained_models();
+        // This local is the last reference to an eager chunk transcriber;
+        // leaving it set would keep the model alive past idle eviction.
+        *eager_transcriber = None;
+        self.play_feedback(SoundEvent::Cancelled);
+
+        // Run post_output_command to reset compositor submap
+        if let Some(cmd) = &self.config.output.post_output_command {
+            if let Err(e) = output::run_hook(cmd, "post_output").await {
+                tracing::warn!("{}", e);
+            }
+        }
+
+        end_recording_notification(
+            "Cancelled",
+            "Recording discarded",
+            &self.config.output.notification,
+            self.config.engine,
+        )
+        .await;
     }
 
     /// Cancel an active streaming session: signal the backend, drop capture,
@@ -2151,6 +2252,101 @@ impl Daemon {
         }
     }
 
+    /// Whether the primary model of the active engine is retained in
+    /// `transcriber_preloaded` between dictations.
+    ///
+    /// Whisper is excluded because `ModelManager` owns its retention; Soniox
+    /// is a cloud engine with no local model to keep resident.
+    fn retains_preloaded_primary(&self) -> bool {
+        self.config.idle_unload_secs > 0
+            && self.config.on_demand_loading()
+            && !matches!(
+                self.config.engine,
+                crate::config::TranscriptionEngine::Whisper
+                    | crate::config::TranscriptionEngine::Soniox
+            )
+    }
+
+    /// Whether this recording may use eager chunk processing.
+    ///
+    /// Eager processing is configured on the Whisper section but also runs for
+    /// a non-Whisper engine whose model was preloaded before the recording
+    /// started. The retained non-Whisper slot is populated after the previous
+    /// dictation, so it must not make eager start on the on-demand path: that
+    /// path previously had no preloaded transcriber for those engines, and
+    /// streaming already keeps the resident requirement (#779).
+    fn eager_processing_enabled(&self) -> bool {
+        self.config.whisper.eager_processing
+            && (self.config.engine == crate::config::TranscriptionEngine::Whisper
+                || !self.config.on_demand_loading())
+    }
+
+    /// Restart the retained models' idle countdown after a dictation ends.
+    fn touch_retained_models(&mut self) {
+        if self.config.engine == crate::config::TranscriptionEngine::Whisper {
+            if let Some(mm) = self.model_manager.as_mut() {
+                if mm.retains_primary() {
+                    mm.touch_primary();
+                }
+            }
+        }
+        if self.retains_preloaded_primary() && self.transcriber_preloaded.is_some() {
+            self.preloaded_last_used = Some(Instant::now());
+        }
+    }
+
+    /// Evict cached models only while the daemon is idle.
+    ///
+    /// Called from the persistent eviction timer. Unloading a model out from
+    /// under a live recording or transcription would be worse than holding
+    /// it. Returns how many models were released and trims the heap only
+    /// after an actual eviction.
+    fn evict_idle_models_if_idle(&mut self, state: &State, now: Instant) -> usize {
+        if !matches!(state, State::Idle) {
+            return 0;
+        }
+        let mut released = self
+            .model_manager
+            .as_mut()
+            .map(|mm| mm.evict_idle_models_at(now))
+            .unwrap_or(0);
+        // Meeting mode keeps a resident model for its own long-running
+        // capture; never pull it out from under that session.
+        if self.retains_preloaded_primary() && self.meeting_daemon.is_none() {
+            let timeout = Duration::from_secs(self.config.idle_unload_secs);
+            let idle = self.preloaded_last_used.is_some_and(|at| {
+                now.checked_duration_since(at)
+                    .is_some_and(|age| age >= timeout)
+            });
+            if idle {
+                tracing::info!(
+                    "Evicting idle retained model '{}' (unused for {}s)",
+                    self.config.model_name(),
+                    self.config.idle_unload_secs
+                );
+                if self.transcriber_preloaded.take().is_some() {
+                    released += 1;
+                }
+                self.preloaded_last_used = None;
+            }
+        }
+        if released > 0 {
+            release_freed_memory();
+        }
+        released
+    }
+
+    /// Discard a pending on-demand load.
+    ///
+    /// A cache hit supersedes it, and a recording abandoned before
+    /// transcription (too short, no speech, capture error) must not leave a
+    /// finished load task holding the model Arc past idle eviction.
+    fn discard_pending_model_load(&mut self) {
+        if let Some(task) = self.model_load_task.take() {
+            task.abort();
+        }
+    }
+
     /// Get the model ready while the user speaks: start an on-demand load,
     /// or warm the preloaded transcriber (spawning the gpu_isolation worker).
     /// An override the active transcriber can't serve loads its own instead.
@@ -2168,13 +2364,47 @@ impl Daemon {
             // Start model loading in background
             match self.config.engine {
                 crate::config::TranscriptionEngine::Whisper => {
-                    let config = self.config.whisper.clone();
-                    let config_path = self.config_path.clone();
-                    let model_to_load = model_override.map(str::to_string);
-                    self.model_load_task = Some(tokio::task::spawn_blocking(move || {
-                        let mut temp_manager = ModelManager::new(&config, config_path);
-                        temp_manager.get_transcriber(model_to_load.as_deref())
-                    }));
+                    // A retained primary satisfies this recording from cache,
+                    // so there is nothing to load and no event-loop work.
+                    // Overrides keep their previous lifecycle.
+                    let cached = if model_override.is_none() {
+                        let primary = self.config.whisper.model.clone();
+                        self.model_manager
+                            .as_mut()
+                            .filter(|mm| mm.retains_primary())
+                            .and_then(|mm| mm.cached_transcriber(&primary))
+                    } else {
+                        None
+                    };
+                    if cached.is_some() {
+                        tracing::debug!(
+                            "Reusing retained model '{}' for this recording",
+                            self.config.whisper.model
+                        );
+                        self.discard_pending_model_load();
+                    } else {
+                        // The temporary loader below cannot see the models
+                        // this manager already holds. Free a slot first so the
+                        // retained primary and the requested model never
+                        // exceed max_loaded_models together.
+                        let target = model_override
+                            .map(str::to_string)
+                            .unwrap_or_else(|| self.config.whisper.model.clone());
+                        if let Some(mm) = self.model_manager.as_mut() {
+                            if mm.make_room_for(&target) > 0 {
+                                release_freed_memory();
+                            }
+                        }
+                        let config = self.config.whisper.clone();
+                        let config_path = self.config_path.clone();
+                        let idle_unload_secs = self.config.idle_unload_secs;
+                        let model_to_load = model_override.map(str::to_string);
+                        self.model_load_task = Some(tokio::task::spawn_blocking(move || {
+                            let mut temp_manager =
+                                ModelManager::new(&config, config_path, idle_unload_secs);
+                            temp_manager.get_transcriber(model_to_load.as_deref())
+                        }));
+                    }
                 }
                 crate::config::TranscriptionEngine::Parakeet
                 | crate::config::TranscriptionEngine::Moonshine
@@ -2186,6 +2416,18 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::OpenVino
                 | crate::config::TranscriptionEngine::Soniox => {
                     let config = self.config.clone();
+                    if model_override.is_none()
+                        && self.retains_preloaded_primary()
+                        && self.transcriber_preloaded.is_some()
+                    {
+                        tracing::debug!(
+                            "Reusing retained model '{}' for this recording",
+                            self.config.model_name()
+                        );
+                        self.preloaded_last_used = Some(Instant::now());
+                        self.discard_pending_model_load();
+                        return;
+                    }
                     self.model_load_task = Some(tokio::task::spawn_blocking(move || {
                         crate::transcribe::create_transcriber(&config).map(Arc::from)
                     }));
@@ -2419,11 +2661,61 @@ impl Daemon {
             }
         }
         if self.config.on_demand_loading() {
+            // A retained primary hits the cache without a load task. This is
+            // also what makes the second dictation skip the reload.
+            if self.config.engine == crate::config::TranscriptionEngine::Whisper
+                && model_override.is_none()
+            {
+                let primary = self.config.whisper.model.clone();
+                let cached = self
+                    .model_manager
+                    .as_mut()
+                    .filter(|mm| mm.retains_primary())
+                    .and_then(|mm| mm.cached_transcriber(&primary));
+                if let Some(cached) = cached {
+                    tracing::debug!("Using retained model '{}'", primary);
+                    // A duplicate eager-path load may still be pending; it is
+                    // superseded by the retained instance.
+                    self.discard_pending_model_load();
+                    return Ok(cached);
+                }
+            }
+
+            // Retained primary for non-Whisper engines: a cache hit needs no
+            // load task, and the same Arc is reused for the next dictation.
+            if model_override.is_none() && self.retains_preloaded_primary() {
+                if let Some(t) = self.transcriber_preloaded.clone() {
+                    tracing::debug!("Using retained model '{}'", self.config.model_name());
+                    self.preloaded_last_used = Some(Instant::now());
+                    self.discard_pending_model_load();
+                    return Ok(t);
+                }
+            }
+
             // Wait for background model load task
             if let Some(task) = self.model_load_task.take() {
                 match task.await {
                     Ok(Ok(transcriber)) => {
                         tracing::info!("Model loaded successfully");
+                        // Keep the primary in the persistent manager so the
+                        // next dictation can reuse this Arc. A failed or
+                        // panicked load never adopts.
+                        if self.config.engine == crate::config::TranscriptionEngine::Whisper
+                            && model_override.is_none()
+                        {
+                            let primary = self.config.whisper.model.clone();
+                            if let Some(mm) = self.model_manager.as_mut() {
+                                if mm.retains_primary() {
+                                    mm.adopt_transcriber(&primary, transcriber.clone());
+                                }
+                            }
+                        }
+                        // Non-Whisper engines retain their primary in the
+                        // preloaded slot instead of a manager.
+                        if model_override.is_none() && self.retains_preloaded_primary() {
+                            self.transcriber_preloaded = Some(transcriber.clone());
+                            self.preloaded_last_used = Some(Instant::now());
+                        }
                         Ok(transcriber)
                     }
                     Ok(Err(e)) => {
@@ -2471,6 +2763,7 @@ impl Daemon {
                             Ok(Ok(t)) => {
                                 let t: Arc<dyn Transcriber> = Arc::from(t);
                                 self.transcriber_preloaded = Some(t.clone());
+                                self.preloaded_last_used = None;
                                 Ok(t)
                             }
                             Ok(Err(e)) => {
@@ -2976,10 +3269,16 @@ impl Daemon {
     /// Reset state to idle and run post_output_command to reset compositor submap
     /// Call this when exiting from recording/transcribing without normal output flow
     async fn reset_to_idle(&mut self, state: &mut State) {
+        // An abandoned recording can still have an in-flight model load. Drop
+        // the task (and any finished result) so it cannot keep the model Arc
+        // alive after the manager evicts it.
+        self.discard_pending_model_load();
         discard_recording_overrides();
         self.restore_recording_media();
         *state = State::Idle;
         self.update_state("idle");
+        // The retained model's idle countdown starts here, not at load start.
+        self.touch_retained_models();
 
         // Run post_output_command to reset compositor submap
         if let Some(cmd) = &self.config.output.post_output_command {
@@ -3336,8 +3635,15 @@ impl Daemon {
         result: std::result::Result<TranscriptionResult, tokio::task::JoinError>,
     ) {
         self.handle_transcription_result_inner(state, result).await;
+        // Restart the retained model's idle countdown at completion (success,
+        // error, cancel, or panic), never at the start of the load.
+        self.touch_retained_models();
         // The inner handler owns the last reference to an on-demand
-        // transcriber, so by here the model has been dropped.
+        // transcriber, so by here it has been dropped unless the manager
+        // retains it. `malloc_trim` never releases live allocations, so the
+        // retained case needs no special suppression: trimming here is a
+        // no-op for it, and the eviction path trims again once the model is
+        // actually released.
         if self.config.on_demand_loading() {
             release_freed_memory();
         }
@@ -3710,6 +4016,7 @@ impl Daemon {
                              the next recording will re-create it"
                         );
                     }
+                    self.preloaded_last_used = None;
                 }
                 self.reset_to_idle(state).await;
             }
@@ -3939,7 +4246,11 @@ impl Daemon {
         drop(default_chain); // Not used; chain is created per-transcription
 
         // Initialize model manager for multi-model support (Whisper only)
-        let mut model_manager = ModelManager::new(&self.config.whisper, self.config_path.clone());
+        let mut model_manager = ModelManager::new(
+            &self.config.whisper,
+            self.config_path.clone(),
+            self.config.idle_unload_secs,
+        );
 
         // Pre-load transcription model if on_demand_loading is disabled
         if !self.config.on_demand_loading() {
@@ -3959,6 +4270,7 @@ impl Daemon {
                         self.transcriber_preloaded = Some(Arc::from(
                             crate::transcribe::create_transcriber(&self.config)?,
                         ));
+                        self.preloaded_last_used = None;
                     } else {
                         // Use model manager for Whisper
                         if let Err(e) = model_manager.preload_primary() {
@@ -3981,6 +4293,7 @@ impl Daemon {
                     self.transcriber_preloaded = Some(Arc::from(
                         crate::transcribe::create_transcriber(&self.config)?,
                     ));
+                    self.preloaded_last_used = None;
                 }
             }
             tracing::info!("Model loaded, ready for voice input");
@@ -4059,6 +4372,11 @@ impl Daemon {
         recording_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut transcribing_poll = tokio::time::interval(Duration::from_millis(100));
         transcribing_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Idle-model eviction gets its own persistent timer rather than a
+        // recreated sleep arm: the 50ms meeting poll would otherwise restart
+        // the sleep before it could fire, and a dictation that ended while a
+        // meeting was recording would never expire (#644).
+        let mut idle_eviction_poll = new_idle_eviction_poll(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -4118,7 +4436,7 @@ impl Daemon {
                                             audio_capture = Some(capture);
 
                                             // Use EagerRecording state if eager_processing is enabled
-                                            if self.config.whisper.eager_processing {
+                                            if self.eager_processing_enabled() {
                                                 tracing::info!("Using eager input processing");
                                                 state = State::EagerRecording {
                                                     started_at: std::time::Instant::now(),
@@ -4205,6 +4523,7 @@ impl Daemon {
                                     Err(()) => {
                                         state = State::Idle;
                                         self.update_state("idle");
+                                        eager_transcriber = None;
                                         continue;
                                     }
                                 };
@@ -4265,7 +4584,7 @@ impl Daemon {
                                             audio_capture = Some(capture);
 
                                             // Use EagerRecording state if eager_processing is enabled
-                                            if self.config.whisper.eager_processing {
+                                            if self.eager_processing_enabled() {
                                                 tracing::info!("Using eager input processing");
                                                 state = State::EagerRecording {
                                                     started_at: std::time::Instant::now(),
@@ -4341,6 +4660,7 @@ impl Daemon {
                                     Err(()) => {
                                         state = State::Idle;
                                         self.update_state("idle");
+                                        eager_transcriber = None;
                                         continue;
                                     }
                                 };
@@ -4379,41 +4699,12 @@ impl Daemon {
                                 ).await;
                             } else if state.is_recording() {
                                 tracing::info!("Recording cancelled via hotkey");
-
-                                // A cancelled external-trigger session is
-                                // still an ended session — tell the caller
-                                // and disarm tracking.
-                                self.end_external_session(state.is_recording()).await;
-
-                                // Stop recording and discard audio
-                                if let Some(mut capture) = audio_capture.take() {
-                                    let _ = capture.stop().await;
-                                }
-                                self.restore_recording_media();
-
-                                // Cancel any pending model load task
-                                if let Some(task) = self.model_load_task.take() {
-                                    task.abort();
-                                }
-
-                                // Cancel any pending eager chunk tasks
-                                for (_, task) in self.eager_chunk_tasks.drain(..) {
-                                    task.abort();
-                                }
-
-                                discard_recording_overrides();
-                                state = State::Idle;
-                                self.update_state("idle");
-                                self.play_feedback(SoundEvent::Cancelled);
-
-                                // Run post_output_command to reset compositor submap
-                                if let Some(cmd) = &self.config.output.post_output_command {
-                                    if let Err(e) = output::run_hook(cmd, "post_output").await {
-                                        tracing::warn!("{}", e);
-                                    }
-                                }
-
-                                end_recording_notification("Cancelled", "Recording discarded", &self.config.output.notification, self.config.engine).await;
+                                self.cancel_recording_to_idle(
+                                    &mut state,
+                                    &mut audio_capture,
+                                    &mut eager_transcriber,
+                                )
+                                .await;
                             } else if matches!(state, State::Transcribing { .. }) {
                                 tracing::info!("Transcription cancelled via hotkey");
 
@@ -4428,6 +4719,7 @@ impl Daemon {
                                 discard_recording_overrides();
                                 state = State::Idle;
                                 self.update_state("idle");
+                                self.touch_retained_models();
                                 self.play_feedback(SoundEvent::Cancelled);
 
                                 // Run post_output_command to reset compositor submap
@@ -4621,6 +4913,7 @@ impl Daemon {
                                 Ok(transcriber) => transcriber,
                                 Err(()) => {
                                     self.reset_to_idle(&mut state).await;
+                                    eager_transcriber = None;
                                     continue;
                                 }
                             };
@@ -4708,7 +5001,7 @@ impl Daemon {
                                     audio_capture = Some(capture);
 
                                     // Use EagerRecording state if eager_processing is enabled
-                                    if self.config.whisper.eager_processing {
+                                    if self.eager_processing_enabled() {
                                         tracing::info!("Using eager input processing");
                                         state = State::EagerRecording {
                                             started_at: std::time::Instant::now(),
@@ -4923,31 +5216,19 @@ impl Daemon {
 
                 // === MEETING MODE HANDLERS ===
 
-                // Poll for meeting commands (file-based IPC), and carry the
-                // idle model eviction that used to live on the 500ms idle arm.
-                //
-                // That arm never ran: select! drops and recreates its
-                // un-completed timer futures each iteration, so this
-                // unconditional 100ms sleep restarted the 500ms sleep before
-                // it could fire. #606 fixed the cancel-trigger half of that
-                // starvation; eviction was the other half, and it meant a
-                // daemon that loaded a model on demand never released it
-                // (#644).
+                // Poll for meeting commands (file-based IPC). Idle model
+                // eviction lives on its own persistent timer below: a
+                // recreated sleep arm here was restarted by the faster
+                // meeting poll before it could fire (#644).
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // Evict roughly every 60s, and only while idle — unloading
-                    // a model out from under a recording would be worse than
-                    // holding it.
-                    static EVICTION_COUNTER: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let count =
-                        EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count.is_multiple_of(600) && matches!(state, State::Idle) {
-                        if let Some(ref mut mm) = self.model_manager {
-                            mm.evict_idle_models();
-                        }
-                    }
-
                     self.handle_meeting_triggers().await;
+                }
+
+                // Persistent idle-model eviction. The interval keeps its
+                // deadline across cancelled ticks, so the 50ms meeting poll
+                // cannot starve it; only evict while idle.
+                _ = idle_eviction_poll.tick(), if matches!(state, State::Idle) => {
+                    let _ = self.evict_idle_models_if_idle(&state, Instant::now());
                 }
 
                 // Process meeting audio chunks
@@ -5319,6 +5600,582 @@ mod tests {
         config.set_model_for(TranscriptionEngine::Parakeet, "parakeet-tdt-0.6b-v2");
         config.parakeet.as_mut().unwrap().on_demand_loading = on_demand;
         Daemon::new(config, None)
+    }
+
+    /// Whisper daemon with on-demand loading enabled and an idle-retention
+    /// window, matching the runtime state `run()` would set up.
+    fn whisper_on_demand_daemon(idle_unload_secs: u64) -> Daemon {
+        let mut config = Config::default();
+        config.audio.feedback.enabled = false;
+        config.engine = TranscriptionEngine::Whisper;
+        config.whisper.mode = Some(WhisperMode::Local);
+        config.whisper.model = "base.en".to_string();
+        config.whisper.on_demand_loading = true;
+        config.whisper.gpu_isolation = false;
+        config.idle_unload_secs = idle_unload_secs;
+        let mut daemon = Daemon::new(config, None);
+        daemon.model_manager = Some(ModelManager::new(
+            &daemon.config.whisper,
+            None,
+            daemon.config.idle_unload_secs,
+        ));
+        daemon
+    }
+
+    #[tokio::test]
+    async fn retained_whisper_cache_hit_skips_the_load_task() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let cached: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("cached"));
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_for_test("base.en", cached.clone(), true);
+
+        daemon.prepare_for_recording(None);
+        assert!(
+            daemon.model_load_task.is_none(),
+            "a cache hit must not spawn a background load"
+        );
+
+        let got = daemon.get_transcriber_for_recording(None).await.unwrap();
+        assert!(Arc::ptr_eq(&got, &cached), "the cached Arc is reused");
+        assert_eq!(got.transcribe(&[]).unwrap(), "cached");
+    }
+
+    #[tokio::test]
+    async fn finished_on_demand_load_is_adopted_into_the_manager() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let loaded: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("loaded"));
+        let task_arc = loaded.clone();
+        daemon.model_load_task = Some(tokio::task::spawn_blocking(move || Ok(task_arc)));
+
+        let got = daemon.get_transcriber_for_recording(None).await.unwrap();
+        assert!(Arc::ptr_eq(&got, &loaded));
+
+        let cached = daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .cached_transcriber("base.en")
+            .expect("the loaded primary must be adopted");
+        assert!(Arc::ptr_eq(&got, &cached));
+    }
+
+    #[tokio::test]
+    async fn failed_on_demand_load_is_not_adopted() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        daemon.model_load_task = Some(tokio::task::spawn_blocking(|| {
+            Err(crate::error::TranscribeError::InitFailed("boom".into()))
+        }));
+
+        assert!(daemon.get_transcriber_for_recording(None).await.is_err());
+        assert!(
+            daemon
+                .model_manager
+                .as_ref()
+                .unwrap()
+                .loaded_model_names()
+                .is_empty(),
+            "a failed load must not leave a model in the cache"
+        );
+    }
+
+    #[test]
+    fn retained_primary_is_evicted_only_while_idle() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let base = Instant::now();
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_at_for_test(
+                "base.en",
+                Arc::new(FixedTranscriber("cached")),
+                true,
+                base,
+            );
+
+        let recording = State::Recording {
+            started_at: base,
+            model_override: None,
+        };
+        daemon.evict_idle_models_if_idle(&recording, base + Duration::from_secs(31));
+        assert!(
+            daemon
+                .model_manager
+                .as_ref()
+                .unwrap()
+                .loaded_model_names()
+                .contains(&"base.en"),
+            "eviction must not run outside Idle"
+        );
+
+        daemon.evict_idle_models_if_idle(&State::Idle, base + Duration::from_secs(31));
+        assert!(daemon
+            .model_manager
+            .as_ref()
+            .unwrap()
+            .loaded_model_names()
+            .is_empty());
+    }
+
+    /// The retained primary of a non-Whisper engine is reused across
+    /// dictations instead of being loaded again.
+    #[tokio::test]
+    async fn retained_preloaded_reuses_the_same_arc_on_the_next_dictation() {
+        let mut daemon = parakeet_daemon(true);
+        daemon.config.idle_unload_secs = 60;
+        let retained: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("retained"));
+        daemon.transcriber_preloaded = Some(retained.clone());
+        daemon.preloaded_last_used = Some(Instant::now());
+
+        daemon.prepare_for_recording(None);
+        assert!(
+            daemon.model_load_task.is_none(),
+            "a retained primary must not spawn a background load"
+        );
+
+        let got = daemon.get_transcriber_for_recording(None).await.unwrap();
+        assert!(Arc::ptr_eq(&got, &retained), "the retained Arc is reused");
+        assert_eq!(got.transcribe(&[]).unwrap(), "retained");
+    }
+
+    #[test]
+    fn retained_preloaded_evicts_after_the_idle_window() {
+        let mut daemon = parakeet_daemon(true);
+        daemon.config.idle_unload_secs = 60;
+        let now = Instant::now();
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("retained")));
+        daemon.preloaded_last_used = Some(now.checked_sub(Duration::from_secs(59)).unwrap());
+
+        assert_eq!(
+            daemon.evict_idle_models_if_idle(&State::Idle, now),
+            0,
+            "nothing is released before the idle window elapses"
+        );
+        assert!(daemon.transcriber_preloaded.is_some());
+
+        assert_eq!(
+            daemon.evict_idle_models_if_idle(&State::Idle, now + Duration::from_secs(2)),
+            1,
+            "the eviction must be reported so the caller can trim"
+        );
+        assert!(
+            daemon.transcriber_preloaded.is_none(),
+            "the retained slot is dropped after the idle window"
+        );
+        assert!(daemon.preloaded_last_used.is_none());
+    }
+
+    #[test]
+    fn resident_preloaded_is_never_evicted() {
+        let mut daemon = parakeet_daemon(false);
+        daemon.config.idle_unload_secs = 60;
+        let now = Instant::now();
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("resident")));
+        daemon.preloaded_last_used = Some(now.checked_sub(Duration::from_secs(3600)).unwrap());
+
+        assert_eq!(
+            daemon.evict_idle_models_if_idle(&State::Idle, now),
+            0,
+            "a resident (non on-demand) model is not subject to idle eviction"
+        );
+        assert!(daemon.transcriber_preloaded.is_some());
+    }
+
+    #[test]
+    fn zero_idle_unload_keeps_the_previous_lifecycle() {
+        let mut daemon = parakeet_daemon(true);
+        daemon.config.idle_unload_secs = 0;
+        let now = Instant::now();
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("retained")));
+        daemon.preloaded_last_used = Some(now.checked_sub(Duration::from_secs(3600)).unwrap());
+
+        assert!(
+            !daemon.retains_preloaded_primary(),
+            "idle_unload_secs = 0 must keep the original lifecycle"
+        );
+        assert_eq!(daemon.evict_idle_models_if_idle(&State::Idle, now), 0);
+        assert!(
+            daemon.transcriber_preloaded.is_some(),
+            "the slot must not be touched without an idle window"
+        );
+    }
+
+    #[test]
+    fn non_idle_state_never_evicts_the_retained_slot() {
+        let mut daemon = parakeet_daemon(true);
+        daemon.config.idle_unload_secs = 60;
+        let now = Instant::now();
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("retained")));
+        daemon.preloaded_last_used = Some(now.checked_sub(Duration::from_secs(3600)).unwrap());
+
+        let recording = State::Recording {
+            started_at: now,
+            model_override: None,
+        };
+        assert_eq!(daemon.evict_idle_models_if_idle(&recording, now), 0);
+        assert!(
+            daemon.transcriber_preloaded.is_some(),
+            "eviction must not run outside Idle"
+        );
+    }
+
+    #[test]
+    fn touch_retained_models_renews_the_window() {
+        let mut daemon = parakeet_daemon(true);
+        daemon.config.idle_unload_secs = 60;
+        let now = Instant::now();
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("retained")));
+        daemon.preloaded_last_used = Some(now.checked_sub(Duration::from_secs(3600)).unwrap());
+
+        let before = Instant::now();
+        daemon.touch_retained_models();
+
+        let renewed = daemon
+            .preloaded_last_used
+            .expect("retention must restart the countdown");
+        assert!(
+            renewed >= before,
+            "touch must move the timestamp forward to the current instant"
+        );
+    }
+
+    #[test]
+    fn eager_processing_is_whisper_or_resident_only() {
+        // Whisper keeps eager on its on-demand path: the manager serves it.
+        let mut whisper = whisper_on_demand_daemon(0);
+        whisper.config.whisper.eager_processing = true;
+        assert!(whisper.eager_processing_enabled());
+
+        // A non-Whisper engine only uses eager when its model was preloaded
+        // before the recording; the retained slot must not enable it.
+        let mut parakeet_on_demand = parakeet_daemon(true);
+        parakeet_on_demand.config.whisper.eager_processing = true;
+        assert!(!parakeet_on_demand.eager_processing_enabled());
+
+        let mut parakeet_resident = parakeet_daemon(false);
+        parakeet_resident.config.whisper.eager_processing = true;
+        assert!(parakeet_resident.eager_processing_enabled());
+
+        // The config switch still governs every engine.
+        let mut disabled = parakeet_daemon(false);
+        disabled.config.whisper.eager_processing = false;
+        assert!(!disabled.eager_processing_enabled());
+    }
+
+    /// Blocker 4: trimming must follow an actual release, and not be
+    /// suppressed just because the primary is retained.
+    #[test]
+    fn idle_eviction_trims_only_after_an_actual_release() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let base = Instant::now();
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_at_for_test(
+                "base.en",
+                Arc::new(FixedTranscriber("cached")),
+                true,
+                base,
+            );
+
+        let before = trim_calls_for_test();
+        assert_eq!(
+            daemon.evict_idle_models_if_idle(&State::Idle, base + Duration::from_secs(29)),
+            0
+        );
+        assert_eq!(
+            trim_calls_for_test(),
+            before,
+            "nothing released means no trim request"
+        );
+
+        assert_eq!(
+            daemon.evict_idle_models_if_idle(&State::Idle, base + Duration::from_secs(31)),
+            1
+        );
+        assert_eq!(
+            trim_calls_for_test(),
+            before + 1,
+            "the trim request must follow the model release"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_idle_restarts_the_retained_model_clock() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let base = Instant::now();
+        let stale = base
+            .checked_sub(Duration::from_secs(5))
+            .expect("monotonic clock has at least 5s of uptime");
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_at_for_test(
+                "base.en",
+                Arc::new(FixedTranscriber("cached")),
+                true,
+                stale,
+            );
+
+        let mut state = State::Transcribing { audio: Vec::new() };
+        daemon.reset_to_idle(&mut state).await;
+        assert!(matches!(state, State::Idle));
+
+        // 29s after the reset: alive only if the countdown restarted at Idle.
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .evict_idle_models_at(base + Duration::from_secs(29));
+        assert!(
+            daemon
+                .model_manager
+                .as_ref()
+                .unwrap()
+                .loaded_model_names()
+                .contains(&"base.en"),
+            "reset_to_idle must renew the idle clock"
+        );
+
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .evict_idle_models_at(base + Duration::from_secs(31));
+        assert!(daemon
+            .model_manager
+            .as_ref()
+            .unwrap()
+            .loaded_model_names()
+            .is_empty());
+    }
+
+    #[test]
+    fn zero_idle_unload_does_not_retain_the_primary() {
+        let mut daemon = whisper_on_demand_daemon(0);
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_for_test("base.en", Arc::new(FixedTranscriber("cached")), true);
+        assert!(
+            !daemon.model_manager.as_ref().unwrap().retains_primary(),
+            "idle_unload_secs = 0 must keep the original unload-after-use behavior"
+        );
+    }
+
+    /// Blocker 1: a recording abandoned before transcription (too short, no
+    /// speech, or capture error) must not leave a finished load task holding
+    /// the model Arc past idle eviction.
+    #[tokio::test]
+    async fn abandoning_a_recording_releases_the_pending_load_arc() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let loaded: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("loaded"));
+        let weak = Arc::downgrade(&loaded);
+        let task_arc = loaded.clone();
+        daemon.model_load_task = Some(tokio::task::spawn_blocking(move || Ok(task_arc)));
+        drop(loaded);
+        while !daemon.model_load_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut state = State::Recording {
+            started_at: Instant::now(),
+            model_override: None,
+        };
+        let mut capture: Option<Box<dyn AudioCapture>> = None;
+
+        assert!(
+            !daemon
+                .start_transcription_task(&mut state, &mut capture, None)
+                .await
+        );
+        assert!(matches!(state, State::Idle));
+        assert!(
+            weak.upgrade().is_none(),
+            "the abandoned load task must not keep the model Arc alive"
+        );
+    }
+
+    /// Blocker 2: a failed eager transcriber lookup returns to Idle without
+    /// clearing the eager Arc, which would survive idle eviction.
+    #[tokio::test]
+    async fn eager_load_failure_drops_the_eager_transcriber_arc() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let eager: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("eager"));
+        let weak = Arc::downgrade(&eager);
+        let mut eager_slot = Some(eager);
+        let mut state = State::EagerRecording {
+            started_at: Instant::now(),
+            model_override: None,
+            accumulated_audio: Vec::new(),
+            chunks_sent: 0,
+            chunk_results: Vec::new(),
+            tasks_in_flight: 0,
+        };
+        let mut capture: Option<Box<dyn AudioCapture>> = None;
+        let mut streaming_session: Option<StreamingSession> = None;
+        let mut streaming_chain: Option<Vec<Box<dyn TextOutput>>> = None;
+
+        daemon
+            .stop_active_recording(
+                &mut state,
+                &mut capture,
+                &mut streaming_session,
+                &mut streaming_chain,
+                &mut eager_slot,
+            )
+            .await;
+
+        assert!(matches!(state, State::Idle));
+        assert!(eager_slot.is_none(), "the eager Arc must be cleared");
+        assert!(
+            weak.upgrade().is_none(),
+            "the eager Arc must not survive the abandoned session"
+        );
+    }
+
+    /// Blocker 2: the hotkey cancel path used to leave the eager Arc alive.
+    #[tokio::test]
+    async fn hotkey_cancel_recording_clears_the_eager_arc() {
+        let mut daemon = whisper_on_demand_daemon(30);
+        let eager: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("eager"));
+        let eager_weak = Arc::downgrade(&eager);
+        let mut eager_slot = Some(eager);
+
+        let loaded: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("loaded"));
+        let load_weak = Arc::downgrade(&loaded);
+        daemon.model_load_task = Some(tokio::task::spawn_blocking(move || Ok(loaded)));
+        while !daemon.model_load_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut state = State::Recording {
+            started_at: Instant::now(),
+            model_override: None,
+        };
+        let mut capture: Option<Box<dyn AudioCapture>> = None;
+        daemon
+            .cancel_recording_to_idle(&mut state, &mut capture, &mut eager_slot)
+            .await;
+
+        assert!(matches!(state, State::Idle));
+        assert!(daemon.model_load_task.is_none());
+        assert!(
+            load_weak.upgrade().is_none(),
+            "the pending load Arc must be released"
+        );
+        assert!(eager_slot.is_none(), "the eager Arc must be cleared");
+        assert!(
+            eager_weak.upgrade().is_none(),
+            "the hotkey cancel path must not leave the eager Arc alive"
+        );
+    }
+
+    /// Blocker 3: the 50ms meeting poll used to restart the recreated 100ms
+    /// eviction sleep forever. The persistent timer must keep firing and
+    /// release an overdue retained model while the meeting arm runs.
+    #[tokio::test]
+    async fn idle_eviction_timer_fires_under_a_faster_meeting_arm() {
+        let mut daemon = whisper_on_demand_daemon(1);
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("monotonic clock has at least 2s of uptime");
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_at_for_test(
+                "base.en",
+                Arc::new(FixedTranscriber("cached")),
+                true,
+                stale,
+            );
+
+        let mut eviction = new_idle_eviction_poll(Duration::from_millis(30));
+        let mut eviction_ticks = 0u32;
+        let mut meeting_ticks = 0u32;
+        while meeting_ticks < 60 && eviction_ticks == 0 {
+            tokio::select! {
+                _ = eviction.tick() => {
+                    eviction_ticks += 1;
+                    daemon.evict_idle_models_if_idle(&State::Idle, Instant::now());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    meeting_ticks += 1;
+                }
+            }
+        }
+
+        assert!(
+            eviction_ticks > 0,
+            "eviction timer was starved by the faster meeting arm \
+             (ticks={eviction_ticks}, meeting_ticks={meeting_ticks})"
+        );
+        assert!(
+            daemon
+                .model_manager
+                .as_ref()
+                .unwrap()
+                .loaded_model_names()
+                .is_empty(),
+            "the overdue retained model must be evicted while the meeting poll runs \
+             (ticks={eviction_ticks}, meeting_ticks={meeting_ticks})"
+        );
+    }
+
+    /// Blocker 5: with one loaded-model slot, requesting a different model
+    /// must release the retained primary before the temporary loader starts.
+    #[tokio::test]
+    async fn secondary_request_frees_the_primary_when_max_loaded_is_one() {
+        let mut config = Config::default();
+        config.audio.feedback.enabled = false;
+        config.engine = TranscriptionEngine::Whisper;
+        config.whisper.mode = Some(WhisperMode::Local);
+        config.whisper.model = "base.en".to_string();
+        config.whisper.on_demand_loading = true;
+        config.idle_unload_secs = 30;
+        config.whisper.max_loaded_models = 1;
+        config.whisper.secondary_model = Some("voxtype-test-missing.bin".to_string());
+        let mut daemon = Daemon::new(config, None);
+        daemon.model_manager = Some(ModelManager::new(
+            &daemon.config.whisper,
+            None,
+            daemon.config.idle_unload_secs,
+        ));
+
+        let primary: Arc<dyn Transcriber> = Arc::new(FixedTranscriber("primary"));
+        let weak = Arc::downgrade(&primary);
+        daemon
+            .model_manager
+            .as_mut()
+            .unwrap()
+            .insert_loaded_model_for_test("base.en", primary, true);
+
+        daemon.prepare_for_recording(Some("voxtype-test-missing.bin"));
+        let task = daemon
+            .model_load_task
+            .take()
+            .expect("on-demand load task should start");
+        assert!(
+            task.await.unwrap().is_err(),
+            "the deliberately missing model must fail to load"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the retained primary must be released to respect max_loaded_models = 1"
+        );
+        assert!(daemon
+            .model_manager
+            .as_ref()
+            .unwrap()
+            .loaded_model_names()
+            .is_empty());
     }
 
     #[test]

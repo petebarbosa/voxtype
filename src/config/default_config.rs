@@ -13,6 +13,15 @@ pub const DEFAULT_CONFIG: &str = r#"# Voxtype Configuration
 # Required for `voxtype record toggle` and `voxtype status` commands.
 state_file = "auto"
 
+# Seconds the active engine keeps its primary model loaded between dictations.
+# Root key (not under [whisper]): it applies to whichever engine is active and
+# requires that engine's on_demand_loading = true. 0 unloads after every
+# dictation; N > 0 keeps the model for N idle seconds so dictations that arrive
+# close together skip the reload. Whisper also requires gpu_isolation = false
+# and max_loaded_models > 0. Secondary Whisper models follow
+# whisper.cold_model_timeout_secs instead.
+# idle_unload_secs = 0
+
 [hotkey]
 # Key to hold for push-to-talk
 # Common choices: SCROLLLOCK, PAUSE, RIGHTALT, F13-F24
@@ -424,5 +433,40 @@ pub fn default_config_content() -> String {
     #[cfg(not(target_os = "macos"))]
     {
         DEFAULT_CONFIG.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn default_config_documents_idle_unload_secs_at_root() {
+        let key = "# idle_unload_secs = 0";
+        let key_at = DEFAULT_CONFIG
+            .find(key)
+            .expect("the template should document the new key as a commented default");
+        let whisper_at = DEFAULT_CONFIG
+            .find("\n[whisper]\n")
+            .expect("the template ships a [whisper] table");
+        assert!(
+            key_at < whisper_at,
+            "idle_unload_secs is a root key, not a [whisper] setting"
+        );
+        assert!(
+            DEFAULT_CONFIG.contains("requires that engine's on_demand_loading = true"),
+            "the template should state the on-demand requirement"
+        );
+    }
+
+    #[test]
+    fn default_config_parses_with_idle_unload_disabled() {
+        // The shipped template keeps the key commented out, so a fresh install
+        // must resolve to 0 and keep unloading after each dictation.
+        let config: Config =
+            toml::from_str(&default_config_content()).expect("shipped default config must parse");
+        assert_eq!(config.idle_unload_secs, 0);
+        assert_eq!(config.whisper.cold_model_timeout_secs, 300);
     }
 }

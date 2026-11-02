@@ -32,6 +32,12 @@ pub struct Config {
     #[serde(default)]
     pub engine: TranscriptionEngine,
 
+    /// Seconds the primary model of the active engine stays loaded after a
+    /// dictation when that engine's `on_demand_loading` is on. 0 unloads
+    /// after each dictation.
+    #[serde(default)]
+    pub idle_unload_secs: u64,
+
     /// Parakeet configuration (optional, only used when engine = "parakeet")
     #[serde(default)]
     pub parakeet: Option<ParakeetConfig>,
@@ -121,6 +127,7 @@ impl Default for Config {
             whisper: WhisperConfig::default(),
             output: OutputConfig::default(),
             engine: TranscriptionEngine::default(),
+            idle_unload_secs: 0,
             parakeet: None,
             moonshine: None,
             sensevoice: None,
@@ -589,6 +596,21 @@ mod tests {
         assert_eq!(config.whisper.model, "base.en");
         assert_eq!(config.output.mode, OutputMode::Type);
         assert!(!config.output.auto_submit);
+        assert_eq!(config.idle_unload_secs, 0);
+    }
+
+    #[test]
+    fn test_root_idle_unload_secs_parses() {
+        let config: Config = toml::from_str("idle_unload_secs = 600\n").unwrap();
+        assert_eq!(config.idle_unload_secs, 600);
+    }
+
+    #[test]
+    fn test_root_idle_unload_secs_does_not_need_whisper_table() {
+        // The key is a root scalar: a file with no [whisper] section at all
+        // still resolves it.
+        let config: Config = toml::from_str("idle_unload_secs = 900\n").unwrap();
+        assert_eq!(config.idle_unload_secs, 900);
     }
 
     #[test]

@@ -160,7 +160,7 @@ sets the window class to `voxtype` so compositors can float it.
 | Meeting | Meeting mode enable, speaker diarization, audio source (mic/system/both) |
 | Notifications | Desktop notifications for recording start/stop and transcription |
 | Waybar | Status integration: icon theme + per-state icon overrides |
-| Advanced | GPU isolation, on-demand model loading, flash attention, eager processing, GPU device |
+| Advanced | GPU isolation, on-demand model loading (with its idle-unload window), flash attention, eager processing, GPU device |
 
 #### Keyboard
 
@@ -427,6 +427,11 @@ Configuration file location: `~/.config/voxtype/config.toml`
 ### Full Configuration Reference
 
 ```toml
+# Root key: seconds to keep the active engine's model loaded between
+# dictations (requires that engine's on_demand_loading = true).
+# 0 = unload after each dictation.
+# idle_unload_secs = 0
+
 [hotkey]
 # The key to hold for push-to-talk recording
 # Common choices: SCROLLLOCK, PAUSE, RIGHTALT, F13-F24
@@ -909,6 +914,20 @@ Whisper is OpenAI's speech recognition model, running locally via whisper.cpp. I
 - Active community and frequent updates
 
 This is the recommended engine for most users.
+
+**Keeping the model loaded between dictations:** with `on_demand_loading = true` on the active engine, the model loads when a dictation starts and is freed when it ends. The root `idle_unload_secs` key keeps it around for a while instead, so dictations that arrive close together skip the load. It applies to whichever engine is active, not only Whisper:
+
+```toml
+# root, applies to the active engine
+idle_unload_secs = 300   # unload after 5 idle minutes (0 = unload right away)
+
+[whisper]
+on_demand_loading = true
+```
+
+The window restarts when each dictation ends, including after a cancellation or failure, and eviction only runs while the daemon is idle. The first dictation after the window expires loads the model again. For Whisper, retention also requires `gpu_isolation = false`; with GPU isolation each recording runs in a subprocess that exits afterwards. Secondary Whisper models keep following `cold_model_timeout_secs`, a separate setting where `0` means never unload. Streaming still requires a resident model (#779): retention speeds up batch dictations but does not make streaming work with on-demand loading.
+
+In `voxtype configure`, open the **Advanced** section and find the **Idle unload (seconds)** field. It is dimmed when the active engine's on-demand loading is off (set that in the **Engine** section) or, for Whisper, when GPU isolation is on; the help panel explains why it has no effect.
 
 ### Parakeet
 
